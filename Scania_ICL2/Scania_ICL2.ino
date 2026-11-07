@@ -5,31 +5,45 @@
 // Arduino Mega + DFRobot CAN shield (MCP2515), 250 kbps, 29-bit J1939 IDs.
 //
 // Serial input (115200 baud), one line per update:
-//   d<speed km/h x10>,<rpm>,<fuel % x10>,<flags>,<odometer km x10>,<water C>,<oil C>
-// Example: "d853,1450,725,5,1234567,88,95"
+//   d<speed km/h x10>,<rpm>,<fuel % x10>,<flags>,<odometer km x10>,<water C>,<oil C>,<gear>
+// Example: "d853,1450,725,5,1234567,88,95,4"
 //   = 85.3 km/h, 1450 rpm, 72.5 % fuel, left indicator + high beam,
-//     123456.7 km, water 88 C, oil 95 C.
+//     123456.7 km, water 88 C, oil 95 C, gear 4.
 // Only the first 3 fields are required; missing trailing fields are left unchanged.
 //
 // flags bitmask: 1 left indicator, 2 right indicator, 4 high beam, 8 low beam,
 //                16 parking brake, 32 parking lights.  Hazards = 1 + 2.
+// gear: -1 (any negative) reverse, 0 neutral, 1..n forward.
+//
+// Bench findings:
+//  - Gear display: the cluster shows the ETC2 (18F00503, source 03, priority 6) "transmission current
+//    range" text, bytes 7-8, as ASCII: 33 00 shows "3", 35 00 shows "5". The gear number bytes
+//    (1 and 4) alone show nothing, whatever the offset. The requested range (bytes 5-6) is not needed
+//    but is sent as well. Found with an automatic test suite.
+//  - Coordinator frame 0CFFB027: the second byte (index 1) = 0x80 with all other bytes FF makes the
+//    cluster show the "usterka ABS przyczepy" (trailer ABS fault) warning. Probe frame:
+//    ID 0CFFB027 : FF 80 FF FF FF FF FF FF
+//    The frame has fields the FMS doc doesn't describe; byte 1 looks like a trailer ABS status field.
+//  - With the parking-lights bit "on" the cluster dims its backlight (night mode); see
+//    INVERT_PARKING_LIGHTS.
 
-#define ENABLE_CCVS 1     // extra CCVS frame (parking brake + speed). Set 0 if it upsets the cluster.
-#define TEMP_OFFSET 40    // J1939 coolant temp: raw = C + 40. Adjust if the gauge reads off.
+#define ENABLE_CCVS 1             // extra CCVS frame (parking brake + speed). Set 0 if it upsets the cluster.
+#define TEMP_OFFSET 40            // J1939 coolant temp: raw = C + 40. Adjust if the gauge reads off.
 #define INVERT_PARKING_LIGHTS 1   // 1: cluster bright when game lights are ON, dim when OFF. 0: the other way round.
-#define BLINK_MS 350      // indicator on/off time (the Arduino generates the flashing)
+#define BLINK_MS 350              // indicator on/off time (the Arduino generates the flashing)
 
 const uint8_t F_LEFT = 1, F_RIGHT = 2, F_HIGH = 4, F_LOW = 8, F_PARKBRAKE = 16, F_PARKLIGHTS = 32;
 
 DFRobot_MCP2515 CAN(10);
 
 // ---- live values, updated from serial ----
-uint8_t eec1[8]       = {0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x2E, 0x03, 0xFF};  // rpm: bytes 3..4
+uint8_t eec1[8]       = {0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x2E, 0x03, 0xFF};  // rpm: bytes 3..4 (starts at 0)
 uint8_t speedFrame[8] = {0xFF, 0xFF, 0xFF, 0x00, 0xFF, 0xFF, 0x00, 0x00};  // speed: bytes 6..7
-uint8_t fuel[8]       = {0xFF, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};   // level: byte 1
+uint8_t fuel[8]       = {0xFF, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};  // level: byte 1 (starts at 0)
 uint8_t coolant[8]    = {141, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};   // water: byte 0, oil: bytes 2..3
 uint8_t cuvInfo[8]    = {0x00, 0xFF, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF};  // lights + VIS fix
 uint8_t distanceFrame[8] = {0x00, 0xC2, 0x78, 0x01, 0x00, 0x00, 0x00, 0x00}; // odometer: bytes 0..3
+uint8_t etc2[8]       = {0xFF, 0xFF, 0xFF, 0xFF, 'N', 0x00, 'N', 0x00};    // gear text: bytes 4..7
 #if ENABLE_CCVS
 uint8_t ccvs[8]       = {0xF3, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};  // parking brake + speed
 #endif
@@ -97,6 +111,22 @@ void setOilTemp(int c) {                   // 0.03125 C per bit, offset -273 C
   coolant[3] = raw >> 8;
 }
 
+void setGear(int gear) {                   // -reverse, 0 neutral, +forward
+  // The cluster shows the "transmission range" text: 2 ASCII bytes, displayed as sent.
+  char c1, c2 = 0;
+  if (gear < 0) c1 = 'R';
+  else if (gear == 0) c1 = 'N';
+  else if (gear < 10) c1 = '0' + gear;
+  else {                                   // two digits, e.g. 12
+    gear = constrain(gear, 10, 99);
+    c1 = '0' + gear / 10;
+    c2 = '0' + gear % 10;
+  }
+  etc2[4] = etc2[6] = c1;                  // requested range / current range
+  etc2[5] = etc2[7] = c2;
+}
+
+// ---- lamps (indicators flash from the lever state) ----
 uint8_t curFlags = 0;                      // lever/switch state from the PC
 bool blinkPhase = false;                   // generated flashing phase
 unsigned long lastBlink = 0;
@@ -142,7 +172,7 @@ void blinkTick() {
 
 // ---- serial line parser (non-blocking) ----
 void readSerial() {
-  static char buf[48];
+  static char buf[56];
   static uint8_t n = 0;
   while (Serial.available()) {
     char c = Serial.read();
@@ -151,9 +181,9 @@ void readSerial() {
       n = 0;
       if (buf[0] != 'd') continue;
 
-      int s = 0, r = 0, f = 0, fl = 0, w = 0, o = 0;
+      int s = 0, r = 0, f = 0, fl = 0, w = 0, o = 0, g = 0;
       long odo = 0;
-      int cnt = sscanf(buf + 1, "%d,%d,%d,%d,%ld,%d,%d", &s, &r, &f, &fl, &odo, &w, &o);
+      int cnt = sscanf(buf + 1, "%d,%d,%d,%d,%ld,%d,%d,%d", &s, &r, &f, &fl, &odo, &w, &o, &g);
       if (cnt >= 3) {
         setSpeed(constrain(s, 0, 2500));
         setRpm(constrain(r, 0, 8000));
@@ -164,6 +194,7 @@ void readSerial() {
       if (cnt >= 5) setOdometer((uint32_t)constrain(odo, 0L, 20000000L));
       if (cnt >= 6) setWaterTemp(w);
       if (cnt >= 7) setOilTemp(o);
+      if (cnt >= 8) setGear(g);
     } else if (n < sizeof(buf) - 1) {
       buf[n++] = c;
     }
@@ -194,6 +225,7 @@ void txPeriodic() {
     sendFrame(0x18FFFAE6, allFF);
     sendFrame(0x18FEC1EE, distanceFrame);
     sendFrame(0x18FEE427, ignFrame);
+    sendFrame(0x18F00503, etc2);
 #if ENABLE_CCVS
     sendFrame(0x18FEF100, ccvs);
 #endif
@@ -217,6 +249,7 @@ void txPeriodic() {
 
 void setup() {
   Serial.begin(115200);
+  setGear(0);                              // start in neutral
 
   while (CAN.begin(CAN_250KBPS) != 0) {
     Serial.println(F("CAN init error, retrying..."));
@@ -229,11 +262,12 @@ void setup() {
 void loop() {
   readSerial();
 
-  // no data from the PC for 2 s -> zero speed, rpm and lights
+  // no data from the PC for 2 s -> zero speed, rpm, lights and gear
   if (lastTelemetry && millis() - lastTelemetry > 2000) {
     setSpeed(0);
     setRpm(0);
     setFlags(0);
+    setGear(0);
     lastTelemetry = 0;
   }
 

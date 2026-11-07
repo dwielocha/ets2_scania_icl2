@@ -4,17 +4,18 @@ ETS2 -> Scania ICL bridge.
 
 Reads the ets2-telemetry-server JSON and sends one text line per update to the
 Arduino Mega:
-    d<speed km/h x10>,<rpm>,<fuel % x10>,<flags>,<odometer km x10>,<water C>,<oil C>\n
+    d<speed km/h x10>,<rpm>,<fuel % x10>,<flags>,<odometer km x10>,<water C>,<oil C>,<gear>\n
 
 flags: 1 left indicator, 2 right indicator, 4 high beam, 8 low beam,
        16 parking brake, 32 parking lights (hazards = left + right)
+gear:  -1 reverse, 0 neutral, 1..n forward
 
 Usage:
     pip install pyserial
     python ets2_bridge.py COM5            # real run, indicators follow the lever, Arduino flashes them
     python ets2_bridge.py COM5 --lamp     # indicators follow the game's lamp field (if your server has it)
     python ets2_bridge.py --dry           # only print values, no serial (checks the JSON)
-    python ets2_bridge.py COM5 --test     # fake data, no game needed (sweeps speed/rpm/fuel, cycles lights)
+    python ets2_bridge.py COM5 --test     # fake data, no game needed (sweeps speed/rpm/fuel, cycles lights and gears)
 """
 import json
 import sys
@@ -41,10 +42,10 @@ def blinker(truck, side, use_lever):
 
 
 def convert(d, use_lever):
-    """Return (speed_x10, rpm, fuel_x10, flags, odo_x10, water, oil)."""
+    """Return (speed_x10, rpm, fuel_x10, flags, odo_x10, water, oil, gear)."""
     truck = d["truck"]
     if not d["game"]["connected"]:
-        return 0, 0, 0, 0, last["odo"], last["water"], last["oil"]
+        return 0, 0, 0, 0, last["odo"], last["water"], last["oil"], 0
 
     speed = abs(float(truck["speed"]))           # km/h in the Funbit server
     rpm = float(truck["engineRpm"])
@@ -63,6 +64,8 @@ def convert(d, use_lever):
     last["water"] = int(round(float(truck.get("waterTemperature", last["water"]))))
     last["oil"] = int(round(float(truck.get("oilTemperature", last["oil"]))))
 
+    gear = int(truck.get("displayedGear", truck.get("gear", 0)))
+
     return (
         max(0, min(2500, int(round(speed * 10)))),
         max(0, min(8000, int(round(rpm)))),
@@ -71,6 +74,7 @@ def convert(d, use_lever):
         last["odo"],
         last["water"],
         last["oil"],
+        max(-10, min(20, gear)),
     )
 
 
@@ -83,7 +87,8 @@ def test_values(t):
     fuel = 100 - (t % 60) / 60 * 100
     seq = [0, 1, 2, 3, 4, 8, 16, 32]             # none, L, R, hazards, high, low, park brake, park lights
     flags = seq[int(t // 3) % len(seq)]
-    return int(speed * 10), int(rpm), int(fuel * 10), flags, 1234567, 85, 90
+    gear = 0 if speed < 1 else min(12, int(speed / 9) + 1)
+    return int(speed * 10), int(rpm), int(fuel * 10), flags, 1234567, 85, 90, gear
 
 
 def main():
@@ -107,23 +112,23 @@ def main():
         try:
             if test:
                 data = {"truck": {}}
-                s, r, f, fl, odo, w, o = test_values(time.time() - start)
+                s, r, f, fl, odo, w, o, g = test_values(time.time() - start)
                 if fl != prev_flags[0]:
                     prev_flags[0] = fl
                     print(f"test: flags {fl:06b}")
             else:
                 data = fetch()
-                s, r, f, fl, odo, w, o = convert(data, use_lever)
+                s, r, f, fl, odo, w, o, g = convert(data, use_lever)
             if dry:
                 t = data["truck"]
                 print(
                     f"speed {s/10:5.1f}  rpm {r:5d}  fuel {f/10:5.1f}%  flags {fl:06b}  "
-                    f"odo {odo/10:9.1f}  water {w}  oil {o}  | "
+                    f"odo {odo/10:9.1f}  water {w}  oil {o}  gear {g}  | "
                     f"blinkerL on/active: {t.get('blinkerLeftOn')}/{t.get('blinkerLeftActive')}  "
                     f"R: {t.get('blinkerRightOn')}/{t.get('blinkerRightActive')}"
                 )
             else:
-                ser.write(f"d{s},{r},{f},{fl},{odo},{w},{o}\n".encode("ascii"))
+                ser.write(f"d{s},{r},{f},{fl},{odo},{w},{o},{g}\n".encode("ascii"))
         except Exception as e:                    # server not running, game closed, ...
             print("telemetry error:", e)
             time.sleep(1)
